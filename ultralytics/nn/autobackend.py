@@ -278,9 +278,12 @@ class AutoBackend(nn.Module):
             im = im.half()
 
         # Build forward kwargs based on backend type
+        cuda_graph = kwargs.pop("cuda_graph", False)
         forward_kwargs = {}
         if self.format == "pt":
             forward_kwargs = {"augment": augment, "visualize": visualize, "embed": embed, **kwargs}
+        elif self.format == "engine":
+            forward_kwargs = {"cuda_graph": cuda_graph}
 
         y = self.backend.forward(im, **forward_kwargs)
 

@@ -19,7 +19,7 @@ class TensorRTBackend(BaseBackend):
     """NVIDIA TensorRT inference backend for GPU-accelerated deployment.
 
     Loads and runs inference with NVIDIA TensorRT serialized engines (.engine files). Supports both TensorRT 7-9 and
-    TensorRT 10/11 APIs, dynamic input shapes, FP16 precision, and DLA core offloading.
+    TensorRT 10/11 APIs, dynamic input shapes, FP16 precision, DLA core offloading, and CUDA Graph inference.
     """
 
     def load_model(self, weight: str | Path) -> None:
@@ -111,31 +111,98 @@ class TensorRTBackend(BaseBackend):
             self.bindings[name] = Binding(name, dtype, shape, im, int(im.data_ptr()))
 
         self.binding_addrs = OrderedDict((n, d.ptr) for n, d in self.bindings.items())
+        self.cuda_graph = None
+        self.cuda_graph_shape = None
+        self.cuda_graph_stream = None
+        self.cuda_graph_warmup_stream = None
         self.model = engine
 
-    def forward(self, im: torch.Tensor) -> list[torch.Tensor]:
+    def _set_shape(self, im: torch.Tensor, persistent_input: bool = False) -> None:
+        """Set a dynamic input shape and resize output buffers."""
+        binding = self.bindings["images"]
+        shape_changed = self.dynamic and im.shape != binding.shape
+        if shape_changed:
+            if self.is_trt10:
+                self.context.set_input_shape("images", im.shape)
+            else:
+                self.context.set_binding_shape(self.model.get_binding_index("images"), im.shape)
+            binding = binding._replace(shape=im.shape)
+
+        if persistent_input and binding.data.shape != im.shape:
+            data = torch.empty(im.shape, dtype=binding.data.dtype, device=self.device)
+            binding = binding._replace(shape=im.shape, data=data, ptr=int(data.data_ptr()))
+        self.bindings["images"] = binding
+        self.binding_addrs["images"] = binding.ptr
+
+        if not shape_changed:
+            return
+
+        self.cuda_graph = None
+        for name in self.output_names:
+            i = None if self.is_trt10 else self.model.get_binding_index(name)
+            shape = tuple(self.context.get_tensor_shape(name) if self.is_trt10 else self.context.get_binding_shape(i))
+            data = self.bindings[name].data
+            data.resize_(shape)
+            self.bindings[name] = self.bindings[name]._replace(shape=shape, data=data, ptr=int(data.data_ptr()))
+            self.binding_addrs[name] = self.bindings[name].ptr
+
+    def _execute_async(self, stream: torch.cuda.Stream) -> None:
+        """Enqueue TensorRT inference on a CUDA stream."""
+        if self.is_trt10:
+            for name, address in self.binding_addrs.items():
+                self.context.set_tensor_address(name, address)
+            success = self.context.execute_async_v3(stream.cuda_stream)
+        else:
+            success = self.context.execute_async_v2(
+                bindings=list(self.binding_addrs.values()), stream_handle=stream.cuda_stream
+            )
+        if not success:
+            raise RuntimeError("TensorRT inference execution failed")
+
+    def _capture_cuda_graph(self, shape: torch.Size) -> None:
+        """Warm up and capture TensorRT inference for a fixed input shape."""
+        self.cuda_graph_stream = torch.cuda.Stream(device=self.device)
+        self.cuda_graph_warmup_stream = torch.cuda.Stream(device=self.device)
+        with torch.cuda.stream(self.cuda_graph_warmup_stream):
+            for _ in range(3):
+                self._execute_async(self.cuda_graph_warmup_stream)
+        self.cuda_graph_warmup_stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=self.cuda_graph_stream):
+            self._execute_async(self.cuda_graph_stream)
+        self.cuda_graph = graph
+        self.cuda_graph_shape = tuple(shape)
+
+    def _forward_cuda_graph(self, im: torch.Tensor) -> list[torch.Tensor]:
+        """Run TensorRT with persistent buffers and CUDA Graph replay."""
+        self._set_shape(im, persistent_input=True)
+        s = self.bindings["images"].shape
+        assert im.shape == s, f"input size {im.shape} not equal to engine size {s}"
+
+        if self.cuda_graph is None or self.cuda_graph_shape != tuple(im.shape):
+            self._capture_cuda_graph(im.shape)
+
+        with torch.cuda.stream(self.cuda_graph_stream):
+            self.bindings["images"].data.copy_(im)
+            self.cuda_graph.replay()
+        self.cuda_graph_stream.synchronize()
+        return [self.bindings[x].data for x in sorted(self.output_names)]
+
+    def forward(self, im: torch.Tensor, cuda_graph: bool = False) -> list[torch.Tensor]:
         """Run NVIDIA TensorRT inference with dynamic shape handling.
 
         Args:
             im (torch.Tensor): Input image tensor in BCHW format on the CUDA device.
+            cuda_graph (bool): Run inference by replaying a captured CUDA Graph.
 
         Returns:
             (list[torch.Tensor]): Model predictions as a list of tensors on the CUDA device.
         """
-        if self.dynamic and im.shape != self.bindings["images"].shape:
-            if self.is_trt10:
-                self.context.set_input_shape("images", im.shape)
-                self.bindings["images"] = self.bindings["images"]._replace(shape=im.shape)
-                for name in self.output_names:
-                    self.bindings[name].data.resize_(tuple(self.context.get_tensor_shape(name)))
-            else:
-                i = self.model.get_binding_index("images")
-                self.context.set_binding_shape(i, im.shape)
-                self.bindings["images"] = self.bindings["images"]._replace(shape=im.shape)
-                for name in self.output_names:
-                    i = self.model.get_binding_index(name)
-                    self.bindings[name].data.resize_(tuple(self.context.get_binding_shape(i)))
+        if cuda_graph:
+            return self._forward_cuda_graph(im)
 
+        self._set_shape(im)
         s = self.bindings["images"].shape
         assert im.shape == s, f"input size {im.shape} {'>' if self.dynamic else 'not equal to'} max model size {s}"
 

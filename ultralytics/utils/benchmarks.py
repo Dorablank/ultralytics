@@ -276,6 +276,7 @@ class ProfileModels:
         quantize (int | str | None): Export precision for TensorRT profiling, e.g. 16 (FP16) or 8 (INT8).
         trt (bool): Flag to indicate whether to profile using TensorRT.
         device (torch.device): Device used for profiling.
+        trt_cuda_graph (bool): Whether to use CUDA Graph replay for TensorRT profiling.
 
     Methods:
         run: Profile YOLO models for speed and accuracy across various formats.
@@ -305,6 +306,7 @@ class ProfileModels:
         quantize: int | str | None = 16,
         trt: bool = True,
         device: torch.device | str | None = None,
+        trt_cuda_graph: bool = True,
     ):
         """Initialize the ProfileModels class for profiling models.
 
@@ -317,6 +319,7 @@ class ProfileModels:
             quantize (int | str | None): Export precision for TensorRT profiling, e.g. 16 (FP16, default) or 8 (INT8).
             trt (bool): Flag to indicate whether to profile using TensorRT.
             device (torch.device | str | None): Device used for profiling. If None, it is determined automatically.
+            trt_cuda_graph (bool): Use CUDA Graph replay while retaining Ultralytics inference timing.
 
         Notes:
             quantize applies only to the TensorRT profiling export; ONNX profiling stays FP32 (FP16 is slower on CPU).
@@ -329,6 +332,7 @@ class ProfileModels:
         self.quantize = quantize
         self.trt = trt  # run TensorRT profiling
         self.device = device if isinstance(device, torch.device) else select_device(device)
+        self.trt_cuda_graph = trt_cuda_graph
 
     def run(self):
         """Profile YOLO models for speed and accuracy across various formats including ONNX and TensorRT.
@@ -452,7 +456,7 @@ class ProfileModels:
         for _ in range(3):
             start_time = time.time()
             for _ in range(self.num_warmup_runs):
-                model(input_data, imgsz=self.imgsz, verbose=False)
+                model(input_data, imgsz=self.imgsz, verbose=False, cuda_graph=self.trt_cuda_graph)
             elapsed = time.time() - start_time
 
         # Compute number of runs as higher of min_time or num_timed_runs
@@ -461,7 +465,7 @@ class ProfileModels:
         # Timed runs
         run_times = []
         for _ in TQDM(range(num_runs), desc=engine_file):
-            results = model(input_data, imgsz=self.imgsz, verbose=False)
+            results = model(input_data, imgsz=self.imgsz, verbose=False, cuda_graph=self.trt_cuda_graph)
             run_times.append(results[0].speed["inference"])  # Convert to milliseconds
 
         run_times = self.iterative_sigma_clipping(np.array(run_times), sigma=2, max_iters=3)  # sigma clipping

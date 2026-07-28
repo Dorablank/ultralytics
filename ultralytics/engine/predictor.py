@@ -179,12 +179,21 @@ class BasePredictor:
 
     def inference(self, im: torch.Tensor, *args, **kwargs):
         """Run inference on a given image using the specified model and arguments."""
+        cuda_graph = kwargs.pop("cuda_graph", self.args.cuda_graph)
         visualize = (
             increment_path(self.save_dir / Path(self.batch[0][0]).stem, mkdir=True)
             if self.args.visualize and (not self.source_type.tensor)
             else False
         )
-        return self.model(im, *args, augment=self.args.augment, visualize=visualize, embed=self.args.embed, **kwargs)
+        return self.model(
+            im,
+            *args,
+            augment=self.args.augment,
+            visualize=visualize,
+            embed=self.args.embed,
+            cuda_graph=cuda_graph,
+            **kwargs,
+        )
 
     def pre_transform(self, im: list[np.ndarray]) -> list[np.ndarray]:
         """Pre-transform input image before inference.
